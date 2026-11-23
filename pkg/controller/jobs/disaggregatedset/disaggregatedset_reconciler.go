@@ -414,7 +414,8 @@ func (r *Reconciler) recoverWorkload(ctx context.Context, ds *disaggregatedsetv1
 			if !pod.DeletionTimestamp.IsZero() {
 				return nil
 			}
-			if err := r.client.Delete(ctx, pod); client.IgnoreNotFound(err) != nil {
+			// A StatefulSet can replace the Pod with a new UID at the same name.
+			if err := r.client.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); client.IgnoreNotFound(err) != nil {
 				return fmt.Errorf("deleting Pod %s of slice %d: %w", klog.KObj(pod), sw.slice, err)
 			}
 			return nil

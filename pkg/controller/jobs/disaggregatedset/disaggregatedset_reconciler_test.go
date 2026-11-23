@@ -29,6 +29,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/component-base/featuregate"
@@ -164,6 +165,7 @@ func TestReconciler(t *testing.T) {
 		UID(prefillLWS + "-1").
 		NodeName("node").
 		StatusPhase(corev1.PodRunning)
+	replacementPrefillPod := adoptedPrefillPod.Clone().Name(runningPrefillPod.Obj().Name).UID("replacement")
 	decodeLWSObj := testinglws.MakeLeaderWorkerSet(decodeLWS, testNS).
 		UID(decodeLWS).
 		OwnerReferenceWithUID(testDS, gvk, testDS).
@@ -212,6 +214,8 @@ func TestReconciler(t *testing.T) {
 		wantEvents    []utiltesting.EventRecord
 		// createErr is returned by every Workload create, and by Reconcile.
 		createErr error
+		// replacementPod is created after recovery lists its running Pods.
+		replacementPod *corev1.Pod
 		// wantOwnerGets is the number of StatefulSets, LeaderWorkerSets and Pods
 		// that Reconcile fetches one by one, when set.
 		wantOwnerGets *int32
@@ -421,6 +425,15 @@ func TestReconciler(t *testing.T) {
 			workloads:     []kueue.Workload{*outOfSyncWorkload.Clone().Obj()},
 			pods:          []corev1.Pod{*runningPrefillPod.Clone().Obj()},
 			wantWorkloads: []kueue.Workload{*outOfSyncWorkload.Clone().Obj()},
+		},
+		"preserves a replacement Pod created while recovering an out of sync Workload": {
+			ds:             baseDS.Clone().Obj(),
+			owners:         []client.Object{prefillLWSObj.Obj(), prefillSTS.Obj()},
+			workloads:      []kueue.Workload{*outOfSyncWorkload.Clone().Obj()},
+			pods:           []corev1.Pod{*runningPrefillPod.Clone().Obj()},
+			replacementPod: replacementPrefillPod.DeepCopy(),
+			wantPods:       []corev1.Pod{*replacementPrefillPod.DeepCopy()},
+			wantWorkloads:  []kueue.Workload{*outOfSyncWorkload.Clone().Obj()},
 		},
 		"waits for a deleting Pod of the slice that is on a node before recreating its out of sync Workload": {
 			ds:            baseDS.Clone().Obj(),
@@ -825,6 +838,24 @@ func TestReconciler(t *testing.T) {
 					}
 					return c.Create(ctx, obj, opts...)
 				},
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					pod, isPod := obj.(*corev1.Pod)
+					if isPod && tc.replacementPod != nil && pod.Name == tc.replacementPod.Name {
+						if err := c.Delete(ctx, pod); err != nil {
+							return err
+						}
+						replacement := tc.replacementPod.DeepCopy()
+						if err := c.Create(ctx, replacement); err != nil {
+							return err
+						}
+						// The fake client does not enforce UID preconditions.
+						preconditions := (&client.DeleteOptions{}).ApplyOptions(opts).Preconditions
+						if preconditions != nil && preconditions.UID != nil && *preconditions.UID != replacement.UID {
+							return apierrors.NewConflict(corev1.Resource("pods"), pod.Name, errors.New("pod UID precondition failed"))
+						}
+					}
+					return c.Delete(ctx, obj, opts...)
+				},
 				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 					switch obj.(type) {
 					case *appsv1.StatefulSet, *leaderworkersetv1.LeaderWorkerSet, *corev1.Pod:
@@ -854,7 +885,12 @@ func TestReconciler(t *testing.T) {
 				t.Fatalf("Error creating the reconciler: %v", err)
 			}
 
-			if _, err := reconciler.Reconcile(ctx, request); !errors.Is(err, tc.createErr) {
+			_, err = reconciler.Reconcile(ctx, request)
+			if tc.replacementPod != nil {
+				if !apierrors.IsConflict(err) {
+					t.Errorf("Reconcile returned error %v, want a conflict so recovery retries", err)
+				}
+			} else if !errors.Is(err, tc.createErr) {
 				t.Errorf("Reconcile returned error %v, want %v", err, tc.createErr)
 			}
 
